@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>种植花园价值计算器</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- 导航菜单 -->
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="nav-logo">
+                <h2>🌱 种植花园</h2>
+            </div>
+            <ul class="nav-menu">
+                <li class="nav-item">
+                    <a href="#calculator" class="nav-link active">价值计算器</a>
+                </li>
+                <li class="nav-item">
+                    <a href="#plants" class="nav-link">植物图鉴</a>
+                </li>
+                <li class="nav-item">
+                    <a href="#guide" class="nav-link">种植指南</a>
+                </li>
+                <li class="nav-item">
+                    <a href="#about" class="nav-link">关于我们</a>
+                </li>
+            </ul>
+            <div class="hamburger">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+            </div>
+        </div>
+    </nav>
+
+    <!-- 主要内容区域 -->
+    <main>
+
+
+        <!-- 价值计算器部分 -->
+        <section id="calculator" class="calculator-section">
+            <div class="container">
+                <h2>花园价值计算器</h2>
+                <div class="calculator-grid">
+                    <div class="calculator-form">
+                        <div class="form-group">
+                            <label for="plant-select">选择植物</label>
+                            <select id="plant-select" class="form-control">
+                                <option value="">请选择植物...</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="quantity">数量</label>
+                            <input type="number" id="quantity" class="form-control" min="1" value="1">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="quality">品质</label>
+                            <select id="quality" class="form-control">
+                                <option value="1">普通 (1x)</option>
+                                <option value="1.5">良好 (1.5x)</option>
+                                <option value="2">优秀 (2x)</option>
+                                <option value="3">完美 (3x)</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="season">季节加成</label>
+                            <select id="season" class="form-control">
+                                <option value="1">无加成</option>
+                                <option value="1.2">春季</option>
+                                <option value="1.2">夏季</option>
+                                <option value="1.2">秋季</option>
+                                <option value="1.2">冬季</option>
+                            </select>
+                        </div>
+                        
+                        <button id="calculate-btn" class="calculate-button">计算价值</button>
+                    </div>
+                    
+                    <div class="calculator-result">
+                        <div class="result-card">
+                            <h3>计算结果</h3>
+                            <div class="result-item">
+                                <span class="result-label">基础价值:</span>
+                                <span id="base-value" class="result-value">0 金币</span>
+                            </div>
+                            <div class="result-item">
+                                <span class="result-label">品质加成:</span>
+                                <span id="quality-bonus" class="result-value">0 金币</span>
+                            </div>
+                            <div class="result-item">
+                                <span class="result-label">季节加成:</span>
+                                <span id="season-bonus" class="result-value">0 金币</span>
+                            </div>
+                            <div class="result-item total">
+                                <span class="result-label">总价值:</span>
+                                <span id="total-value" class="result-value">0 金币</span>
+                            </div>
+                        </div>
+                        
+                        <div class="profit-analysis">
+                            <h4>利润分析</h4>
+                            <div class="profit-item">
+                                <span>种子成本:</span>
+                                <span id="seed-cost">0 金币</span>
+                            </div>
+                            <div class="profit-item">
+                                <span>净利润:</span>
+                                <span id="net-profit">0 金币</span>
+                            </div>
+                            <div class="profit-item">
+                                <span>利润率:</span>
+                                <span id="profit-margin">0%</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 植物图鉴部分 -->
+        <section id="plants" class="plants-section">
+            <div class="container">
+                <h2>植物图鉴</h2>
+                <div class="plants-filter">
+                    <input type="text" id="plant-search" placeholder="搜索植物..." class="search-input">
+                    <select id="category-filter" class="filter-select">
+                        <option value="">所有类别</option>
+                        <option value="vegetables">蔬菜</option>
+                        <option value="fruits">水果</option>
+                        <option value="flowers">花卉</option>
+                        <option value="herbs">草药</option>
+                    </select>
+                </div>
+                <div id="plants-grid" class="plants-grid">
+                    <!-- 植物卡片将通过JavaScript动态生成 -->
+                </div>
+            </div>
+        </section>
+
+        <!-- 种植指南部分 -->
+        <section id="guide" class="guide-section">
+            <div class="container">
+                <h2>种植指南</h2>
+                <div class="guide-content">
+                    <div class="guide-card">
+                        <h3>🌱 新手入门</h3>
+                        <ul>
+                            <li>从简单的蔬菜开始，如萝卜和土豆</li>
+                            <li>注意季节变化对植物生长的影响</li>
+                            <li>合理规划种植时间，避免浪费</li>
+                            <li>投资优质种子，提高产量和品质</li>
+                        </ul>
+                    </div>
+                    <div class="guide-card">
+                        <h3>💰 经济策略</h3>
+                        <ul>
+                            <li>关注市场价格波动</li>
+                            <li>种植高价值作物，如草莓和蓝莓</li>
+                            <li>利用季节加成最大化收益</li>
+                            <li>建立多样化的植物组合</li>
+                        </ul>
+                    </div>
+                    <div class="guide-card">
+                        <h3>🎯 高级技巧</h3>
+                        <ul>
+                            <li>使用肥料提高作物品质</li>
+                            <li>合理轮作保持土壤肥力</li>
+                            <li>建立温室延长种植季节</li>
+                            <li>参与社区活动获得稀有种子</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 关于我们部分 -->
+        <section id="about" class="about-section">
+            <div class="container">
+                <h2>关于我们</h2>
+                <div class="about-content">
+                    <p>种植花园价值计算器是一个专为种植类游戏玩家设计的工具。我们致力于帮助玩家优化种植策略，最大化游戏收益。</p>
+                    <div class="features">
+                        <div class="feature">
+                            <h3>🎯 精确计算</h3>
+                            <p>基于游戏数据提供准确的价值计算</p>
+                        </div>
+                        <div class="feature">
+                            <h3>📊 数据分析</h3>
+                            <p>详细的利润分析和投资建议</p>
+                        </div>
+                        <div class="feature">
+                            <h3>🌿 植物图鉴</h3>
+                            <p>完整的植物信息和种植指南</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- 页脚 -->
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2024 种植花园价值计算器. 保留所有权利.</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html> 
