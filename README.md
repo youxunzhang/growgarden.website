@@ -158,6 +158,26 @@
 
 ## 🤝 贡献指南
 
+## 🕹️ 游戏信息采集脚本
+
+仓库提供了 `scrape_gamedistribution.py` 用于批量抓取 [gamedistribution.com](https://gamedistribution.com/) 的游戏详情信息并下载图标。
+
+### 使用方法
+
+```bash
+python scrape_gamedistribution.py \
+  --urls https://gamedistribution.com/games/hawaii-match-5/ \
+  --output data/games.json \
+  --img-dir img
+```
+
+- `--urls` 可以同时传入多个游戏链接或游戏别名（slug）。
+- `--input-file` 参数允许从文本文件读取更多链接，每行一个，支持 `#` 注释。
+- `--output` 指定保存 JSON 数据的位置（默认 `data/games.json`）。
+- `--img-dir` 指定图标保存目录（默认 `img/`）。
+
+脚本会自动合并已有的 JSON 数据并在抓取成功时更新/新增条目，同时将图标保存到指定目录下。
+
 欢迎提交问题报告和功能建议！
 
 ### 开发环境
