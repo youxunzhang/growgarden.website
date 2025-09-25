@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""Utilities for scraping game metadata from gamedistribution.com.
-
-The script fetches the public game detail pages, extracts useful metadata
-and downloads the exposed icon assets.  Results are merged into a JSON
-dataset so that subsequent runs can keep the file up to date.
-
-Example
--------
-```
-python scrape_gamedistribution.py \
-    --urls https://gamedistribution.com/games/hawaii-match-5/ \
-    --output data/games.json --img-dir img
-```
-"""
+"""Scrape public GameDistribution game pages and store structured metadata."""
 
 from __future__ import annotations
 
@@ -20,449 +7,697 @@ import argparse
 import dataclasses
 import json
 import mimetypes
-import os
 import re
-import sys
-from dataclasses import dataclass, field
-from html import unescape
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
-from urllib import parse, request
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib import error, parse, request, robotparser
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0 Safari/537.36"
+)
+DEFAULT_RATE_LIMIT_SECONDS = 0.7
+DEFAULT_RETRIES = 3
+DEFAULT_BACKOFF = 2.0
 
 
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9," "*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+@dataclass
+class GameRecord:
+    name: Optional[str]
+    slug: str
+    canonical_url: str
+    description: Optional[str]
+    og_image: Optional[str]
+    play_url: Optional[str]
+    publisher: Optional[str]
+    tags: Optional[List[str]]
+    fetched_at: str
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, object]:
+        data = dataclasses.asdict(self)
+        if not data["tags"]:
+            data["tags"] = None
+        return data
 
 
-class _MetadataParser(HTMLParser):
-    """Minimal HTML parser that gathers meta/link/script content."""
+class GamePageParser(HTMLParser):
+    """Light-weight HTML parser that collects meta/link/script fields."""
 
     def __init__(self) -> None:
         super().__init__()
         self.meta_tags: List[Dict[str, str]] = []
         self.link_tags: List[Dict[str, str]] = []
         self.jsonld_blocks: List[str] = []
+        self.iframes: List[str] = []
+        self._title_chunks: List[str] = []
+        self._capture_title = False
         self._capture_jsonld = False
+        self.heading: Optional[str] = None
+        self._capture_h1 = False
+        self._h1_depth = 0
+        self._h1_chunks: List[str] = []
 
-    def handle_starttag(self, tag: str, attrs: List[tuple[str, Optional[str]]]) -> None:
-        attrs_dict: Dict[str, str] = {
-            name.lower(): (value or "") for name, value in attrs
-        }
-
-        if tag.lower() == "meta":
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attrs_dict: Dict[str, str] = {name.lower(): (value or "") for name, value in attrs}
+        tag_lower = tag.lower()
+        if tag_lower == "meta":
             self.meta_tags.append(attrs_dict)
-        elif tag.lower() == "link":
+        elif tag_lower == "link":
             self.link_tags.append(attrs_dict)
-        elif tag.lower() == "script":
+        elif tag_lower == "script":
             script_type = attrs_dict.get("type", "").lower()
             if script_type == "application/ld+json":
                 self._capture_jsonld = True
             else:
                 self._capture_jsonld = False
+        elif tag_lower == "title":
+            self._capture_title = True
+        elif tag_lower == "iframe":
+            src = attrs_dict.get("src") or attrs_dict.get("data-src") or ""
+            if src:
+                self.iframes.append(src)
+        elif tag_lower == "h1" and self.heading is None:
+            self._capture_h1 = True
+            self._h1_depth = 1
+            self._h1_chunks = []
+        elif self._capture_h1:
+            self._h1_depth += 1
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "script":
+        tag_lower = tag.lower()
+        if tag_lower == "script":
             self._capture_jsonld = False
+        elif tag_lower == "title":
+            self._capture_title = False
+        elif self._capture_h1:
+            self._h1_depth -= 1
+            if self._h1_depth <= 0:
+                text = "".join(self._h1_chunks).strip()
+                if text:
+                    self.heading = text
+                self._capture_h1 = False
+                self._h1_chunks = []
+
+    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        self.handle_starttag(tag, attrs)
 
     def handle_data(self, data: str) -> None:
         if self._capture_jsonld and data.strip():
             self.jsonld_blocks.append(data.strip())
+        if self._capture_title:
+            self._title_chunks.append(data)
+        if self._capture_h1:
+            self._h1_chunks.append(data)
+
+    @property
+    def title(self) -> Optional[str]:
+        text = "".join(self._title_chunks).strip()
+        return text or None
 
 
-@dataclass
-class GameIcon:
-    url: str
-    path: str
+class GameScraper:
+    def __init__(
+        self,
+        *,
+        timeout: float,
+        rate_limit: float,
+        retries: int,
+        backoff_factor: float,
+    ) -> None:
+        self.timeout = timeout
+        self.rate_limit = rate_limit
+        self.retries = retries
+        self.backoff_factor = backoff_factor
+        self._last_request: Optional[float] = None
+        self._robots: Dict[str, robotparser.RobotFileParser] = {}
 
+    # ------------------------------------------------------------------
+    # Networking helpers
+    # ------------------------------------------------------------------
+    def _wait_for_rate_limit(self) -> None:
+        if self._last_request is None:
+            return
+        elapsed = time.monotonic() - self._last_request
+        if elapsed < self.rate_limit:
+            time.sleep(self.rate_limit - elapsed)
 
-@dataclass
-class GameMetadata:
-    slug: str
-    title: Optional[str] = None
-    description: Optional[str] = None
-    categories: List[str] = field(default_factory=list)
-    tags: List[str] = field(default_factory=list)
-    publisher: Optional[str] = None
-    developer: Optional[str] = None
-    language: Optional[str] = None
-    age_rating: Optional[str] = None
-    url: Optional[str] = None
-    icon: Optional[GameIcon] = None
+    def _record_request(self) -> None:
+        self._last_request = time.monotonic()
 
-    def to_dict(self) -> Dict[str, object]:
-        data: Dict[str, object] = {
-            "slug": self.slug,
-            "title": self.title,
-            "description": self.description,
-            "categories": self.categories,
-            "tags": self.tags,
-            "publisher": self.publisher,
-            "developer": self.developer,
-            "language": self.language,
-            "age_rating": self.age_rating,
-            "url": self.url,
+    def _build_headers(self) -> Dict[str, str]:
+        return {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
         }
-        if self.icon:
-            data["icon"] = dataclasses.asdict(self.icon)
+
+    def _robots_for(self, scheme: str, netloc: str) -> robotparser.RobotFileParser:
+        key = f"{scheme}://{netloc}"
+        if key in self._robots:
+            return self._robots[key]
+        robots_url = parse.urlunparse((scheme, netloc, "/robots.txt", "", "", ""))
+        rp = robotparser.RobotFileParser()
+        rp.set_url(robots_url)
+        try:
+            text, _ = self._request_text(robots_url, check_robots=False)
+        except Exception:
+            rp.parse([])
         else:
-            data["icon"] = None
-        return data
+            rp.parse(text.splitlines())
+        self._robots[key] = rp
+        return rp
+
+    def _ensure_allowed(self, url: str) -> None:
+        parsed = parse.urlparse(url)
+        scheme = parsed.scheme or "https"
+        netloc = parsed.netloc
+        if not netloc:
+            return
+        rp = self._robots_for(scheme, netloc)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        if not rp.can_fetch(USER_AGENT, path):
+            raise PermissionError(f"robots.txt forbids accessing {url}")
+
+    def _request_raw(
+        self,
+        url: str,
+        *,
+        check_robots: bool = True,
+    ) -> Tuple[bytes, Dict[str, str]]:
+        if check_robots:
+            self._ensure_allowed(url)
+        headers = self._build_headers()
+        last_error: Optional[Exception] = None
+        for attempt in range(self.retries):
+            if attempt:
+                time.sleep(self.backoff_factor ** (attempt - 1))
+            self._wait_for_rate_limit()
+            req = request.Request(url, headers=headers)
+            try:
+                with request.urlopen(req, timeout=self.timeout) as resp:  # type: ignore[arg-type]
+                    data = resp.read()
+                    headers_map = dict(resp.headers.items())
+            except error.HTTPError as exc:
+                last_error = exc
+                if 400 <= exc.code < 500 and exc.code != 429:
+                    break
+                continue
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                continue
+            finally:
+                self._record_request()
+            return data, headers_map
+        if last_error is None:
+            raise RuntimeError(f"Failed to fetch {url}")
+        raise last_error
+
+    def _request_text(
+        self,
+        url: str,
+        *,
+        check_robots: bool = True,
+    ) -> Tuple[str, Dict[str, str]]:
+        data, headers_map = self._request_raw(url, check_robots=check_robots)
+        encoding = "utf-8"
+        content_type = headers_map.get("Content-Type", "")
+        if "charset=" in content_type:
+            encoding = content_type.split("charset=")[-1].split(";")[0].strip()
+        text = data.decode(encoding, errors="replace")
+        return text, headers_map
+
+    def _request_binary(
+        self,
+        url: str,
+        *,
+        check_robots: bool = True,
+    ) -> Tuple[bytes, Dict[str, str]]:
+        return self._request_raw(url, check_robots=check_robots)
+
+    # ------------------------------------------------------------------
+    # Scraping helpers
+    # ------------------------------------------------------------------
+    def _download_image(
+        self,
+        url: str,
+        target_dir: Path,
+        filename_hint: str,
+    ) -> Optional[Path]:
+        try:
+            payload, headers_map = self._request_binary(url)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] Image download failed for {url}: {exc}")
+            return None
+
+        extension = self._guess_extension(url, headers_map.get("Content-Type"))
+        safe_name = sanitize_filename(filename_hint) or "image"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{safe_name}{extension}"
+        path.write_bytes(payload)
+        return path
+
+    @staticmethod
+    def _guess_extension(url: str, content_type: Optional[str]) -> str:
+        parsed_url = parse.urlparse(url)
+        ext = Path(parsed_url.path).suffix
+        if ext:
+            return _normalise_extension(ext)
+        if content_type:
+            guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
+            if guessed:
+                return _normalise_extension(guessed)
+        return ".jpg"
+
+    def scrape(self, target: str, image_dir: Path) -> Tuple[GameRecord, Optional[Path]]:
+        slug = determine_slug(target)
+        game_url = build_game_url(target)
+        fetched_at = datetime.now(timezone.utc).isoformat()
+
+        try:
+            html, _ = self._request_text(game_url)
+        except Exception as exc:  # noqa: BLE001
+            record = GameRecord(
+                name=None,
+                slug=slug,
+                canonical_url=game_url,
+                description=None,
+                og_image=None,
+                play_url=None,
+                publisher=None,
+                tags=None,
+                fetched_at=fetched_at,
+                error=str(exc),
+            )
+            return record, None
+
+        parser = GamePageParser()
+        parser.feed(html)
+
+        jsonld = extract_game_jsonld(parser.jsonld_blocks)
+
+        canonical_href = link_lookup(parser.link_tags, "canonical")
+        canonical_url = parse.urljoin(game_url, canonical_href) if canonical_href else game_url
+        name = choose_name(jsonld, parser)
+        description = choose_description(jsonld, parser)
+        og_image = choose_og_image(jsonld, parser, canonical_url)
+        play_url = choose_play_url(parser, canonical_url)
+        publisher = choose_publisher(jsonld)
+        tags = choose_tags(jsonld, parser)
+
+        record = GameRecord(
+            name=name,
+            slug=slug,
+            canonical_url=canonical_url,
+            description=description,
+            og_image=og_image,
+            play_url=play_url,
+            publisher=publisher,
+            tags=tags or None,
+            fetched_at=fetched_at,
+        )
+
+        image_path: Optional[Path] = None
+        if record.og_image:
+            filename_hint = record.name or record.slug
+            image_path = self._download_image(record.og_image, image_dir, filename_hint)
+        return record, image_path
 
 
-def _determine_slug(url_or_slug: str) -> str:
+# ----------------------------------------------------------------------
+# Parsing helpers
+# ----------------------------------------------------------------------
+
+def determine_slug(url_or_slug: str) -> str:
     if "://" not in url_or_slug:
         return url_or_slug.strip("/")
-
     parsed = parse.urlparse(url_or_slug)
-    parts = [segment for segment in parsed.path.split("/") if segment]
-    if not parts:
-        raise ValueError(f"Cannot extract slug from URL: {url_or_slug!r}")
-    if "games" in parts:
-        idx = parts.index("games")
-        if idx + 1 >= len(parts):
-            raise ValueError(f"URL does not contain a slug: {url_or_slug!r}")
-        return parts[idx + 1]
-    return parts[-1]
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if not segments:
+        raise ValueError(f"Cannot determine slug from {url_or_slug!r}")
+    if "games" in segments:
+        idx = segments.index("games")
+        if idx + 1 >= len(segments):
+            raise ValueError(f"URL lacks slug component: {url_or_slug!r}")
+        return segments[idx + 1]
+    return segments[-1]
 
 
-def _build_game_url(url_or_slug: str) -> str:
+def build_game_url(url_or_slug: str) -> str:
     if "://" in url_or_slug:
         base = url_or_slug
     else:
         base = f"https://gamedistribution.com/games/{url_or_slug.strip('/')}/"
-
     parsed = parse.urlparse(base)
-    if not parsed.scheme:
-        parsed = parsed._replace(scheme="https")
-    if not parsed.netloc:
-        parsed = parsed._replace(netloc="gamedistribution.com")
-    if not parsed.path.endswith("/"):
-        parsed = parsed._replace(path=parsed.path + "/")
-    return parse.urlunparse(parsed)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or "gamedistribution.com"
+    path = parsed.path
+    if not path.endswith("/"):
+        path += "/"
+    return parse.urlunparse((scheme, netloc, path, "", "", ""))
 
 
-def _http_get(url: str, timeout: float = 30.0) -> tuple[str, Dict[str, str]]:
-    req = request.Request(url, headers=DEFAULT_HEADERS)
-    with request.urlopen(req, timeout=timeout) as resp:  # type: ignore[arg-type]
-        content_type = resp.headers.get("Content-Type", "")
-        encoding = "utf-8"
-        if "charset=" in content_type:
-            encoding = content_type.split("charset=")[-1].split(";")[0].strip()
-        data = resp.read()
-    return data.decode(encoding, errors="replace"), dict(resp.headers.items())
-
-
-def _download_binary(url: str, target_path: Path, timeout: float = 30.0) -> None:
-    req = request.Request(url, headers=DEFAULT_HEADERS)
-    with request.urlopen(req, timeout=timeout) as resp:  # type: ignore[arg-type]
-        target_path.write_bytes(resp.read())
-
-
-def _extract_keywords(value: Optional[str]) -> List[str]:
-    if not value:
-        return []
-    parts = [segment.strip() for segment in re.split(r"[,;]", value) if segment.strip()]
-    return sorted(set(parts), key=str.lower)
-
-
-def _parse_jsonld_blocks(blocks: Iterable[str]) -> Dict[str, object]:
+def extract_game_jsonld(blocks: Iterable[str]) -> Optional[Dict[str, object]]:
     for block in blocks:
         text = block.strip()
         if not text:
             continue
         try:
-            parsed = json.loads(unescape(text))
+            parsed = json.loads(text)
         except json.JSONDecodeError:
             continue
-
-        candidates: List[Dict[str, object]] = []
+        queue: List[Dict[str, object]] = []
         if isinstance(parsed, dict):
-            candidates.append(parsed)
+            queue.append(parsed)
         elif isinstance(parsed, list):
-            candidates.extend([item for item in parsed if isinstance(item, dict)])
-
-        for candidate in candidates:
-            type_value = candidate.get("@type")
-            if isinstance(type_value, list):
-                type_names = [t.lower() for t in type_value if isinstance(t, str)]
-            elif isinstance(type_value, str):
-                type_names = [type_value.lower()]
-            else:
-                type_names = []
-            if any(t in {"videogame", "game"} for t in type_names):
-                return candidate
-    return {}
-
-
-def _meta_lookup(
-    meta_tags: Iterable[Dict[str, str]], *, attr: str, value: str
-) -> Optional[str]:
-    value_lower = value.lower()
-    for attrs in meta_tags:
-        candidate = attrs.get(attr.lower())
-        if candidate and candidate.lower() == value_lower:
-            return attrs.get("content") or attrs.get("value")
+            queue.extend([item for item in parsed if isinstance(item, dict)])
+        while queue:
+            item = queue.pop(0)
+            type_field = item.get("@type")
+            type_names: List[str] = []
+            if isinstance(type_field, str):
+                type_names = [type_field.lower()]
+            elif isinstance(type_field, list):
+                type_names = [str(value).lower() for value in type_field]
+            if any(name in {"videogame", "game", "softwareapplication"} for name in type_names):
+                return item
+            for value in item.values():
+                if isinstance(value, dict):
+                    queue.append(value)
+                elif isinstance(value, list):
+                    queue.extend([child for child in value if isinstance(child, dict)])
     return None
 
 
-def _find_icon_url(
-    jsonld: Dict[str, object],
-    meta_tags: Iterable[Dict[str, str]],
-    link_tags: Iterable[Dict[str, str]],
-) -> Optional[str]:
-    image_value = jsonld.get("image") if isinstance(jsonld, dict) else None
-    if isinstance(image_value, str):
-        return image_value
-    if isinstance(image_value, list):
-        for item in image_value:
-            if isinstance(item, str):
-                return item
-
-    og_image = _meta_lookup(meta_tags, attr="property", value="og:image")
-    if og_image:
-        return og_image
-
+def link_lookup(link_tags: Iterable[Dict[str, str]], rel_value: str) -> Optional[str]:
+    target = rel_value.lower()
     for attrs in link_tags:
         rel = attrs.get("rel", "").lower()
-        if rel in {"icon", "shortcut icon", "apple-touch-icon"}:
+        if rel == target:
             href = attrs.get("href")
             if href:
                 return href
     return None
 
 
-def _normalise_url(url: str, base: str) -> str:
-    return parse.urljoin(base, url)
+def meta_lookup(meta_tags: Iterable[Dict[str, str]], attr: str, value: str) -> Optional[str]:
+    target = value.lower()
+    for attrs in meta_tags:
+        if attrs.get(attr.lower(), "").lower() == target:
+            content = attrs.get("content") or attrs.get("value")
+            if content:
+                return content
+    return None
 
 
-def scrape_game(url_or_slug: str, *, timeout: float = 30.0) -> GameMetadata:
-    slug = _determine_slug(url_or_slug)
-    game_url = _build_game_url(url_or_slug)
-    html, _headers = _http_get(game_url, timeout=timeout)
+def choose_name(jsonld: Optional[Dict[str, object]], parser: GamePageParser) -> Optional[str]:
+    candidates: List[str] = []
+    if isinstance(jsonld, dict):
+        raw = jsonld.get("name")
+        if isinstance(raw, str):
+            candidates.append(raw)
+    if parser.title:
+        candidates.append(parser.title)
+    if parser.heading:
+        candidates.append(parser.heading)
+    for candidate in candidates:
+        cleaned = clean_game_name(candidate)
+        if cleaned:
+            return cleaned
+    return None
 
-    parser = _MetadataParser()
-    parser.feed(html)
 
-    jsonld = _parse_jsonld_blocks(parser.jsonld_blocks)
+def clean_game_name(raw: str) -> str:
+    value = raw.strip()
+    suffixes = [
+        " - Play Free Online Games on GameDistribution.com",
+        " - Play Free Online Games | GameDistribution.com",
+        " - Play Free Online Games",
+        " | GameDistribution.com",
+        " - GameDistribution.com",
+    ]
+    lower_value = value.lower()
+    for suffix in suffixes:
+        if lower_value.endswith(suffix.lower()):
+            value = value[: -len(suffix)]
+            lower_value = value.lower()
+    return value.strip()
 
-    metadata = GameMetadata(slug=slug, url=game_url)
 
-    metadata.title = (
-        jsonld.get("name")
-        if isinstance(jsonld, dict)
-        else _meta_lookup(parser.meta_tags, attr="property", value="og:title")
-    )
-    if not metadata.title:
-        metadata.title = _meta_lookup(parser.meta_tags, attr="name", value="title")
-
-    description = None
+def choose_description(
+    jsonld: Optional[Dict[str, object]],
+    parser: GamePageParser,
+) -> Optional[str]:
     if isinstance(jsonld, dict):
         description = jsonld.get("description") or jsonld.get("abstract")
-    if not isinstance(description, str):
-        description = _meta_lookup(parser.meta_tags, attr="name", value="description")
-    metadata.description = description
+        if isinstance(description, str) and description.strip():
+            return description.strip()
+    meta_description = meta_lookup(parser.meta_tags, "name", "description")
+    if meta_description and meta_description.strip():
+        return meta_description.strip()
+    return None
 
-    categories: List[str] = []
+
+def choose_og_image(
+    jsonld: Optional[Dict[str, object]],
+    parser: GamePageParser,
+    base_url: str,
+) -> Optional[str]:
     if isinstance(jsonld, dict):
-        category_value = jsonld.get("applicationCategory") or jsonld.get("genre")
-        if isinstance(category_value, str):
-            categories.extend(_extract_keywords(category_value))
-        elif isinstance(category_value, list):
-            categories.extend(
-                [str(item).strip() for item in category_value if str(item).strip()]
-            )
-    metadata.categories = sorted(set(categories), key=str.lower)
+        image_value = jsonld.get("image")
+        if isinstance(image_value, str):
+            return parse.urljoin(base_url, image_value)
+        if isinstance(image_value, list):
+            for item in image_value:
+                if isinstance(item, str):
+                    return parse.urljoin(base_url, item)
+    og_image = meta_lookup(parser.meta_tags, "property", "og:image")
+    if og_image:
+        return parse.urljoin(base_url, og_image)
+    image_src = meta_lookup(parser.meta_tags, "itemprop", "image")
+    if image_src:
+        return parse.urljoin(base_url, image_src)
+    for attrs in parser.link_tags:
+        rel = attrs.get("rel", "").lower()
+        if rel in {"image_src", "image"}:
+            href = attrs.get("href")
+            if href:
+                return parse.urljoin(base_url, href)
+    return None
 
-    keywords: List[str] = []
+
+def choose_play_url(parser: GamePageParser, base_url: str) -> Optional[str]:
+    for src in parser.iframes:
+        absolute = parse.urljoin(base_url, src)
+        netloc = parse.urlparse(absolute).netloc.lower()
+        if "html5.gamedistribution.com" in netloc:
+            return absolute
+    if parser.iframes:
+        return parse.urljoin(base_url, parser.iframes[0])
+    return None
+
+
+def choose_publisher(jsonld: Optional[Dict[str, object]]) -> Optional[str]:
+    if not isinstance(jsonld, dict):
+        return None
+    publisher = jsonld.get("publisher") or jsonld.get("provider")
+    if isinstance(publisher, dict):
+        name = publisher.get("name")
+        if isinstance(name, str):
+            stripped = name.strip()
+            if stripped:
+                return stripped
+    if isinstance(publisher, str):
+        stripped = publisher.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def choose_tags(
+    jsonld: Optional[Dict[str, object]],
+    parser: GamePageParser,
+) -> List[str]:
+    tags: List[str] = []
     if isinstance(jsonld, dict):
-        keywords.extend(_extract_keywords(jsonld.get("keywords")))
-        audience = jsonld.get("audience")
-        if isinstance(audience, dict):
-            audience_name = audience.get("audienceType")
-            if isinstance(audience_name, str):
-                keywords.extend(_extract_keywords(audience_name))
-    keywords.extend(
-        _extract_keywords(
-            _meta_lookup(parser.meta_tags, attr="name", value="keywords")
-        )
-    )
-    metadata.tags = sorted(set(keywords), key=str.lower)
-
-    if isinstance(jsonld, dict):
-        publisher = jsonld.get("publisher")
-        if isinstance(publisher, dict):
-            metadata.publisher = publisher.get("name")  # type: ignore[assignment]
-        elif isinstance(publisher, str):
-            metadata.publisher = publisher
-
-        provider = jsonld.get("provider")
-        if isinstance(provider, dict) and not metadata.publisher:
-            metadata.publisher = provider.get("name")  # type: ignore[assignment]
-
-        metadata.developer = None
-        developer = jsonld.get("creator") or jsonld.get("author")
-        if isinstance(developer, dict):
-            metadata.developer = developer.get("name")  # type: ignore[assignment]
-        elif isinstance(developer, list):
-            for item in developer:
-                if isinstance(item, dict) and item.get("@type"):
-                    metadata.developer = item.get("name")  # type: ignore[assignment]
-                    break
-        elif isinstance(developer, str):
-            metadata.developer = developer
-
-        in_language = jsonld.get("inLanguage")
-        if isinstance(in_language, str):
-            metadata.language = in_language
-
-        age_rating = jsonld.get("contentRating") or jsonld.get("ageRating")
-        if isinstance(age_rating, str):
-            metadata.age_rating = age_rating
-
-    icon_url = _find_icon_url(jsonld, parser.meta_tags, parser.link_tags)
-    if icon_url:
-        metadata.icon = GameIcon(url=_normalise_url(icon_url, metadata.url or game_url), path="")
-
-    return metadata
+        tags.extend(split_keywords(jsonld.get("keywords")))
+        tags.extend(split_keywords(jsonld.get("genre")))
+        tags.extend(split_keywords(jsonld.get("applicationCategory")))
+    tags.extend(split_keywords(meta_lookup(parser.meta_tags, "name", "keywords")))
+    unique: List[str] = []
+    seen = set()
+    for tag in tags:
+        normalised = tag.strip()
+        if not normalised:
+            continue
+        key = normalised.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(normalised)
+    return unique
 
 
-def _ensure_directory(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+def split_keywords(value: object) -> List[str]:
+    if isinstance(value, list):
+        result: List[str] = []
+        for item in value:
+            result.extend(split_keywords(item))
+        return result
+    if isinstance(value, str):
+        if "," in value or ";" in value:
+            return [segment.strip() for segment in re.split(r"[,;]", value) if segment.strip()]
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    return []
 
 
-def _determine_icon_path(img_dir: Path, slug: str, icon_url: str) -> Path:
-    parsed = parse.urlparse(icon_url)
-    extension = Path(parsed.path).suffix
-    if not extension:
-        guessed = mimetypes.guess_extension(
-            mimetypes.guess_type(parsed.path or icon_url)[0] or "image/png"
-        )
-        extension = guessed or ".png"
-    return img_dir / f"{slug}{extension}"
+def sanitize_filename(value: str) -> str:
+    cleaned = re.sub(r"[\\/\:*?\"<>|]+", "", value)
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = cleaned.strip("._")
+    return cleaned[:120]
 
 
-def _load_existing_dataset(path: Path) -> Dict[str, Dict[str, object]]:
+def _normalise_extension(ext: str) -> str:
+    cleaned = ext.lower()
+    if cleaned in {".jpeg", ".jpe"}:
+        return ".jpg"
+    if cleaned == ".svgz":
+        return ".svg"
+    return cleaned
+
+
+# ----------------------------------------------------------------------
+# Dataset helpers
+# ----------------------------------------------------------------------
+
+def load_dataset(path: Path) -> Dict[str, Dict[str, object]]:
     if not path.exists():
         return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"Existing dataset at {path} is not valid JSON")
-
-    if isinstance(data, list):
-        result = {}
-        for entry in data:
-            if isinstance(entry, dict) and "slug" in entry:
-                result[str(entry["slug"])] = entry
-        return result
-    if isinstance(data, dict):
-        return {
-            str(slug): value
-            for slug, value in data.items()
-            if isinstance(value, dict)
-        }
-    raise RuntimeError("Unsupported JSON structure in dataset; expected list or object")
-
-
-def _save_dataset(path: Path, data: Dict[str, Dict[str, object]]) -> None:
-    ordered = [data[key] for key in sorted(data.keys())]
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(ordered, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-
-
-def collect_urls(args: argparse.Namespace) -> List[str]:
-    urls: List[str] = []
-    if args.urls:
-        urls.extend(args.urls)
-    if args.input_file:
-        for line in Path(args.input_file).read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
+    records: Dict[str, Dict[str, object]] = {}
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
                 continue
-            urls.append(stripped)
-    return urls
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            slug = entry.get("slug")
+            if slug:
+                records[str(slug)] = entry
+    return records
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def save_dataset(path: Path, records: Dict[str, Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for slug in sorted(records.keys()):
+            json.dump(records[slug], fh, ensure_ascii=False)
+            fh.write("\n")
+
+
+# ----------------------------------------------------------------------
+# Command-line interface
+# ----------------------------------------------------------------------
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--urls",
+        "targets",
         nargs="*",
-        help="One or more game URLs or slugs to scrape.",
+        help="One or more GameDistribution slugs or detail page URLs.",
     )
     parser.add_argument(
         "--input-file",
-        help="Path to a text file that contains additional URLs/slugs (one per line).",
+        type=Path,
+        help="Optional text file that lists targets (one per line, # for comments).",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data") / "games.json",
-        help="Path of the JSON dataset to update.",
+        default=Path("games.jsonl"),
+        help="Destination JSON Lines file (default: games.jsonl).",
     )
     parser.add_argument(
         "--img-dir",
         type=Path,
         default=Path("img"),
-        help="Directory where downloaded icons will be stored.",
+        help="Directory used to store downloaded cover images.",
     )
     parser.add_argument(
         "--timeout",
         type=float,
         default=30.0,
-        help="HTTP timeout in seconds.",
+        help="HTTP timeout in seconds (default: 30).",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=DEFAULT_RATE_LIMIT_SECONDS,
+        help="Minimum delay between requests in seconds (default: 0.7).",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Maximum retry attempts per request (default: 3).",
+    )
+    parser.add_argument(
+        "--backoff",
+        type=float,
+        default=DEFAULT_BACKOFF,
+        help="Backoff multiplier for retries (default: 2.0).",
+    )
+    return parser.parse_args(argv)
+
+
+def collect_targets(args: argparse.Namespace) -> List[str]:
+    targets: List[str] = list(args.targets)
+    if args.input_file:
+        for line in args.input_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            targets.append(stripped)
+    return targets
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    targets = collect_targets(args)
+    if not targets:
+        print("[error] No targets provided. Use positional arguments or --input-file.")
+        return 1
+
+    dataset = load_dataset(args.output)
+    scraper = GameScraper(
+        timeout=args.timeout,
+        rate_limit=args.rate_limit,
+        retries=args.retries,
+        backoff_factor=args.backoff,
     )
 
-    parsed_args = parser.parse_args(argv)
-    urls = collect_urls(parsed_args)
-    if not urls:
-        parser.error("Please provide at least one URL or slug using --urls or --input-file")
+    for target in targets:
+        record, image_path = scraper.scrape(target, args.img_dir)
+        dataset[record.slug] = record.to_dict()
+        if record.error:
+            print(f"[error] {record.slug}: {record.error}")
+        else:
+            message = f"[info] Captured {record.slug}"
+            if image_path:
+                message += f" (image saved to {image_path})"
+            print(message)
 
-    dataset = _load_existing_dataset(parsed_args.output)
-
-    _ensure_directory(parsed_args.output.parent)
-    _ensure_directory(parsed_args.img_dir)
-
-    for target in urls:
-        try:
-            metadata = scrape_game(target, timeout=parsed_args.timeout)
-        except Exception as exc:  # noqa: BLE001 - propagate as friendly message
-            print(f"[error] Failed to scrape {target}: {exc}", file=sys.stderr)
-            continue
-
-        if metadata.icon and metadata.icon.url:
-            icon_url = metadata.icon.url
-            if not icon_url.startswith("http"):
-                icon_url = _normalise_url(icon_url, metadata.url or "")
-
-            icon_path = _determine_icon_path(parsed_args.img_dir, metadata.slug, icon_url)
-            try:
-                _download_binary(icon_url, icon_path, timeout=parsed_args.timeout)
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"[warn] Could not download icon for {metadata.slug} ({icon_url}): {exc}",
-                    file=sys.stderr,
-                )
-            else:
-                metadata.icon.path = str(icon_path)
-
-        dataset[metadata.slug] = metadata.to_dict()
-        print(f"[info] Captured metadata for {metadata.slug}")
-
-    _save_dataset(parsed_args.output, dataset)
-    print(f"[info] Stored dataset to {parsed_args.output}")
+    save_dataset(args.output, dataset)
+    print(f"[info] Wrote dataset to {args.output}")
     return 0
 
 
