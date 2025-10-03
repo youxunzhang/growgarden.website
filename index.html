@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Grow Garden Planner</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div class="container hero__content">
+        <div class="hero__copy">
+          <span class="eyebrow">Grow Garden Planner</span>
+          <h1>让你的菜园规划更轻松</h1>
+          <p>
+            参考 Grow a Garden Calculator，我们重新打造了一款适合国内菜园爱好者的在线规划工具。
+            通过简单的输入就能获得播种密度、浇水频次和肥料建议，帮你在整个种植季保持井井有条。
+          </p>
+          <div class="hero__cta">
+            <a class="button button--primary" href="#calculators">开始计算</a>
+            <a class="button button--ghost" href="#how-it-works">了解详情</a>
+          </div>
+        </div>
+        <div class="hero__card" aria-label="快速计划面板">
+          <h2>快速计划</h2>
+          <form class="quick-plan" id="quickPlanForm">
+            <label>
+              菜床面积 (㎡)
+              <input type="number" name="area" step="0.1" min="0" value="6" />
+            </label>
+            <label>
+              计划种植作物
+              <select name="crop">
+                <option value="tomato">番茄</option>
+                <option value="lettuce">生菜</option>
+                <option value="pepper">甜椒</option>
+                <option value="cucumber">黄瓜</option>
+              </select>
+            </label>
+            <button type="submit" class="button button--primary">生成建议</button>
+          </form>
+          <dl class="quick-plan__result" id="quickPlanResult">
+            <div>
+              <dt>建议种植株数</dt>
+              <dd>—</dd>
+            </div>
+            <div>
+              <dt>每周浇水次数</dt>
+              <dd>—</dd>
+            </div>
+            <div>
+              <dt>本季需肥料</dt>
+              <dd>—</dd>
+            </div>
+          </dl>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section id="calculators" class="section section--accent">
+        <div class="container">
+          <h2>核心计算工具</h2>
+          <div class="calculator-grid">
+            <article class="calculator" aria-labelledby="spacingCalc">
+              <h3 id="spacingCalc">播种密度</h3>
+              <p>根据菜床尺寸和作物株距自动计算可种植株数。</p>
+              <form class="calculator__form" id="spacingForm">
+                <label>
+                  菜床长度 (m)
+                  <input type="number" name="length" step="0.1" min="0" value="2.4" />
+                </label>
+                <label>
+                  菜床宽度 (m)
+                  <input type="number" name="width" step="0.1" min="0" value="1.2" />
+                </label>
+                <label>
+                  行距 (cm)
+                  <input type="number" name="rowSpacing" step="1" min="1" value="45" />
+                </label>
+                <label>
+                  株距 (cm)
+                  <input type="number" name="plantSpacing" step="1" min="1" value="35" />
+                </label>
+                <button class="button button--primary" type="submit">计算结果</button>
+              </form>
+              <p class="calculator__output" id="spacingOutput">—</p>
+            </article>
+
+            <article class="calculator" aria-labelledby="waterCalc">
+              <h3 id="waterCalc">浇水计划</h3>
+              <p>输入土壤类型和温度，获得每周浇水建议频次。</p>
+              <form class="calculator__form" id="waterForm">
+                <label>
+                  土壤类型
+                  <select name="soil">
+                    <option value="sandy">砂质</option>
+                    <option value="loamy" selected>壤土</option>
+                    <option value="clay">黏土</option>
+                  </select>
+                </label>
+                <label>
+                  平均气温 (°C)
+                  <input type="number" name="temperature" step="1" value="25" />
+                </label>
+                <label>
+                  降雨量 (mm/周)
+                  <input type="number" name="rain" step="1" min="0" value="12" />
+                </label>
+                <button class="button button--primary" type="submit">计算结果</button>
+              </form>
+              <p class="calculator__output" id="waterOutput">—</p>
+            </article>
+
+            <article class="calculator" aria-labelledby="harvestCalc">
+              <h3 id="harvestCalc">收获时间表</h3>
+              <p>制定从播种到收获的时间线，便于安排轮作。</p>
+              <form class="calculator__form" id="harvestForm">
+                <label>
+                  作物类型
+                  <select name="crop">
+                    <option value="tomato">番茄</option>
+                    <option value="lettuce" selected>生菜</option>
+                    <option value="carrot">胡萝卜</option>
+                    <option value="beans">四季豆</option>
+                  </select>
+                </label>
+                <label>
+                  播种日期
+                  <input type="date" name="sowDate" />
+                </label>
+                <button class="button button--primary" type="submit">生成时间线</button>
+              </form>
+              <p class="calculator__output" id="harvestOutput">—</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="how-it-works" class="section">
+        <div class="container info-grid">
+          <div>
+            <h2>如何使用 Grow Garden Planner？</h2>
+            <ol class="steps">
+              <li>输入菜床尺寸和期望作物，了解可用的空间和所需种子数量。</li>
+              <li>根据所在地的天气情况，调整浇水计划并设置提醒。</li>
+              <li>生成从播种到收获的时间线，轻松安排轮作和接续种植。</li>
+            </ol>
+          </div>
+          <div class="card">
+            <h3>为什么值得尝试？</h3>
+            <ul class="benefits">
+              <li>数据模型结合热量、降水和经验参数，给出贴近真实的建议。</li>
+              <li>响应式界面，手机与电脑都能顺畅使用。</li>
+              <li>导出结果到 Excel，方便家庭和社区花园共享计划。</li>
+            </ul>
+            <a class="button button--secondary" href="#cta">立即体验</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="section section--accent" id="cta">
+        <div class="container cta">
+          <div>
+            <h2>准备好开始你的丰收季了吗？</h2>
+            <p>
+              使用 Grow Garden Planner 记录每一块菜地的参数。你还可以创建多个花园项目、保存历史记录，并导出到 PDF 与朋友分享。
+            </p>
+          </div>
+          <a class="button button--primary" href="#calculators">立即计算</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="container footer__content">
+        <div>
+          <strong>Grow Garden Planner</strong>
+          <p>灵感来自 Grow a Garden Calculator，致敬全球菜园爱好者。</p>
+        </div>
+        <nav class="footer__nav">
+          <a href="#calculators">工具</a>
+          <a href="#how-it-works">使用指南</a>
+          <a href="#cta">开始体验</a>
+        </nav>
+      </div>
+      <p class="footer__legal">© 2025 Grow Garden Planner. All rights reserved.</p>
+    </footer>
+
+    <script src="script.js"></script>
+  </body>
+</html>
